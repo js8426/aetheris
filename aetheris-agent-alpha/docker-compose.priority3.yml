@@ -1,0 +1,216 @@
+# Aetheris\aetheris-protocol\docker-compose.priority3.yml
+# Aetheris\aetheris-agent-alpha\docker-compose.priority3.yml
+
+#
+# Runs the full Priority 3 Security Agent V stack:
+#   - Redis (state store + pub/sub bus)
+#   - Contract Monitor (3 redundant instances)
+#   - Threat Analysis Engine (2 instances behind load balancer)
+#   - Notification Service
+#
+# Usage:
+#   docker-compose -f docker-compose.priority3.yml up -d
+#
+# Required environment variables — copy .env.example to .env and fill in:
+#   BASE_RPC_PRIMARY, BASE_RPC_SECONDARY, ALCHEMY_KEY
+#   ANTHROPIC_API_KEY
+#   SENDGRID_API_KEY, ALERT_EMAIL_RECIPIENTS
+#   DISCORD_BOT_TOKEN, DISCORD_ALERT_CHANNEL_ID
+#   TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET
+#   PAGERDUTY_INTEGRATION_KEY
+#   PROOF_OF_EXIT_ADDRESS, EXECUTOR_PRIVATE_KEY
+#   BASESCAN_API_KEY
+#   MONITORED_CONTRACTS (JSON array)
+
+version: "3.9"
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Redis — central state store and pub/sub bus
+  # ──────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: aetheris-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning --requirepass ${REDIS_PASSWORD:-aetheris_secure_password}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-aetheris_secure_password}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aetheris_internal
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Contract Monitor — 3 redundant instances for high availability
+  # Instances A, B, C each watch the same contracts independently.
+  # If any two agree on a change, it's considered confirmed.
+  # ──────────────────────────────────────────────────────────────────────────
+  monitor-a:
+    build:
+      context: ./monitor
+      dockerfile: Dockerfile
+    container_name: aetheris-monitor-a
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-aetheris_secure_password}@redis:6379
+      - INSTANCE_ID=monitor-a
+      - BASE_RPC_PRIMARY=${BASE_RPC_PRIMARY}
+      - BASE_RPC_SECONDARY=${BASE_RPC_SECONDARY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - aetheris_internal
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+
+  monitor-b:
+    build:
+      context: ./monitor
+      dockerfile: Dockerfile
+    container_name: aetheris-monitor-b
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-aetheris_secure_password}@redis:6379
+      - INSTANCE_ID=monitor-b
+      - BASE_RPC_PRIMARY=${BASE_RPC_SECONDARY}
+      - BASE_RPC_SECONDARY=${BASE_RPC_TERTIARY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - aetheris_internal
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+
+  monitor-c:
+    build:
+      context: ./monitor
+      dockerfile: Dockerfile
+    container_name: aetheris-monitor-c
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-aetheris_secure_password}@redis:6379
+      - INSTANCE_ID=monitor-c
+      - BASE_RPC_PRIMARY=${BASE_RPC_TERTIARY:-https://base.llamarpc.com}
+      - BASE_RPC_SECONDARY=${BASE_RPC_PRIMARY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - aetheris_internal
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Threat Analysis Engine — 2 instances for redundancy
+  # ──────────────────────────────────────────────────────────────────────────
+  threat-engine-1:
+    build:
+      context: ./analyzer
+      dockerfile: Dockerfile
+    container_name: aetheris-threat-engine-1
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-aetheris_secure_password}@redis:6379
+    ports:
+      - "8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - aetheris_internal
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  threat-engine-2:
+    build:
+      context: ./analyzer
+      dockerfile: Dockerfile
+    container_name: aetheris-threat-engine-2
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-aetheris_secure_password}@redis:6379
+    ports:
+      - "8003:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - aetheris_internal
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Notification Service
+  # ──────────────────────────────────────────────────────────────────────────
+  notifications:
+    build:
+      context: ./notifications
+      dockerfile: Dockerfile
+    container_name: aetheris-notifications
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-aetheris_secure_password}@redis:6379
+    ports:
+      - "8002:8002"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - aetheris_internal
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.25"
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  aetheris_internal:
+    driver: bridge
